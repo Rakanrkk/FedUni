@@ -1,50 +1,68 @@
-import threading
-import time
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch_geometric.nn as pyg_nn
+import torch_geometric.utils as pyg_utils
+import networkx as nx
 
 
-def calculate_packet_error_rate(target1, target2):
-    """
-    计算两点之间的数据包错误率（PER）。
+class GNNModel(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(GNNModel, self).__init__()
+        self.conv1 = pyg_nn.GCNConv(in_channels, 16)
+        self.conv2 = pyg_nn.GCNConv(16, out_channels)
 
-    参数:
-    target1 (tuple): 第一个点（客户端）的 (x, y) 坐标。
-    target2 (tuple): 第二个点（服务器）的 (x, y) 坐标。
+    def forward(self, x, edge_index):
+        x = torch.relu(self.conv1(x, edge_index))
+        x = torch.sigmoid(self.conv2(x, edge_index))
+        return x
 
-    返回:
-    float: 计算出的数据包错误率。
-    """
-    # 常量
-    transmission_power_client = 10e-3  # 客户端的传输功率 10 mW 转换为瓦特
-    noise_power_density = -173  # 噪声功率谱密度 dBm/Hz
-    bandwidth_uplink = 1e6  # 上行链路带宽 1 Mbps 转换为 Hz
-    tau = 1  # 阈值参数，需要根据系统设置来定义或获取
+def loss_fn(edge_scores, edge_index, weights, lambda_, num_nodes):
+    # Compute total weight of selected edges
+    selected_edges = edge_scores > 0.5
+    edge_weights = weights[selected_edges]
+    total_weight = edge_weights.sum()
 
-    # 将噪声功率谱密度从 dBm/Hz 转换为 W/Hz
-    noise_power_density_w = 10 ** ((noise_power_density - 30) / 10)
+    # Compute penalty for shared vertices
+    node_scores = pyg_utils.degree(edge_index[0][selected_edges], num_nodes=num_nodes) + \
+                  pyg_utils.degree(edge_index[1][selected_edges], num_nodes=num_nodes)
+    penalty = lambda_ * (node_scores ** 2).sum()
 
-    # 提取坐标
-    x1, y1 = target1
-    x2, y2 = target2
+    return -total_weight + penalty
 
-    # 计算客户端和服务器之间的距离
-    distance = np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+# 创建随机图和权重
+G = nx.gnm_random_graph(200, 400)
+weights = {e: torch.rand(1).item() for e in G.edges}
+nx.set_edge_attributes(G, weights, "weight")
 
-    # 路径损耗模型（简化为自由空间模型）
-    path_loss = (4 * np.pi * distance * 1e9 / (3e8)) ** 2  # 这里使用 1 GHz 频率作为示例
+# 转换为GNN输入格式
+edge_index = torch.tensor(list(G.edges)).t().contiguous()
+edge_attr = torch.tensor([G[u][v]["weight"] for u, v in G.edges], dtype=torch.float)
+node_features = torch.ones((G.number_of_nodes(), 1))  # 所有节点的特征设为1
 
-    # 信道增益计算
-    channel_gain = 1 / path_loss
+# 将边权重转换为张量
+weights_tensor = torch.tensor([weights[e] for e in G.edges], dtype=torch.float)
 
-    # 信噪比 (SNR) 计算
-    snr = (transmission_power_client * channel_gain) / (noise_power_density_w * bandwidth_uplink)
+# 初始化模型
+model = GNNModel(in_channels=1, out_channels=1)
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+lambda_ = 0.1  # 调整该参数以平衡权重和约束
 
-    # 根据提供的公式计算数据包错误率 (PER)
-    per = 1 - np.exp(-tau * bandwidth_uplink * noise_power_density_w / (transmission_power_client * channel_gain))
+# 训练模型
+num_epochs = 1000
+for epoch in range(num_epochs):
+    model.train()
+    optimizer.zero_grad()
+    edge_scores = model(node_features, edge_index).squeeze()
+    loss = loss_fn(edge_scores, edge_index, weights_tensor, lambda_, node_features.size(0))
+    loss.backward()
+    optimizer.step()
+    if epoch % 100 == 0:
+        print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-    return per
-
-
-# 示例用法
-a = calculate_packet_error_rate((0, 0), (100, 100))
-print(a)
+# 预测边的选择
+model.eval()
+with torch.no_grad():
+    edge_scores = model(node_features, edge_index).squeeze()
+    selected_edges = edge_index[:, edge_scores.topk(20).indices].t().contiguous()
+print("Selected edges:", selected_edges)
